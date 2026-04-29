@@ -1,0 +1,243 @@
+import streamlit as st
+from google import genai
+import gspread
+from google.oauth2.service_account import Credentials
+import uuid
+import datetime
+import time
+import csv
+import io
+import json
+import tempfile
+import os
+from zoneinfo import ZoneInfo
+
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+SPREADSHEET_NAME = "화학탐구챗봇로그"
+st.set_page_config(page_title="🧪 화학 탐구 챗봇", layout="centered")
+
+# 상단 메뉴, 푸터 숨기기
+st.markdown("""
+    <style>
+        #MainMenu {visibility: hidden;}
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
+    </style>
+""", unsafe_allow_html=True)
+@st.cache_resource
+def get_sheet():
+    """Google Sheets 연결 (인증부터 시트 열기까지 한번에)"""
+    try:
+        info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(info, f)
+            temp_path = f.name
+
+        creds = Credentials.from_service_account_file(temp_path, scopes=SCOPES)
+        os.remove(temp_path)  # 인증 완료 후 삭제
+
+        _gc = gspread.authorize(creds)
+        spreadsheet = _gc.open(SPREADSHEET_NAME)
+        sheet = spreadsheet.sheet1
+
+        if sheet.row_count == 0 or not sheet.row_values(1):
+            sheet.append_row(["시간", "세션ID", "이름", "역할", "내용"])
+
+        return sheet
+    except Exception as e:
+        st.error(f"Google Sheets 연결 실패: {e}")
+        return None
+
+
+def save_to_sheet(session_id, user_name, role, content):
+    """대화 내용을 Google Sheets에 한 줄 추가"""
+    sheet = get_sheet()
+    if sheet is None:
+        return
+
+    try:
+        now = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+        sheet.append_row([now, session_id, user_name, role, content])
+    except Exception as e:
+        st.warning(f"시트 저장 중 오류: {e}")
+
+
+def get_all_logs_from_sheet():
+    """Google Sheets에서 전체 대화 로그 가져오기"""
+    sheet = get_sheet()
+    if sheet is None:
+        return []
+
+    try:
+        rows = sheet.get_all_values()
+        # 헤더 제외
+        if len(rows) > 1:
+            return rows[1:]
+        return []
+    except Exception as e:
+        st.warning(f"시트 읽기 중 오류: {e}")
+        return []
+
+
+# ============================================================
+# 2. Gemini API 호출 (자동 재시도 포함)
+# ============================================================
+def get_response(prompt, max_retries=3):
+    """Gemini API 호출 + 503/429 오류 시 자동 재시도"""
+    for i in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash", contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            if "503" in str(e) or "429" in str(e):
+                wait = (i + 1) * 5  # 5초, 10초, 15초 대기
+                time.sleep(wait)
+            else:
+                return f"⚠️ 오류가 발생했습니다: {e}"
+    return "⚠️ 서버가 혼잡합니다. 잠시 후 다시 시도해 주세요."
+
+
+# ============================================================
+# 3. 세션 초기화
+# ============================================================
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())[:8]
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "user_name" not in st.session_state:
+    st.session_state.user_name = ""
+
+# ============================================================
+# 4. 사이드바: 페이지 선택
+# ============================================================
+page = st.sidebar.radio("페이지 선택", ["💬 채팅", "🔐 관리자 페이지"])
+
+# ============================================================
+# 5-A. 채팅 페이지 (학생/응답자용)
+# ============================================================
+if page == "💬 채팅":
+    st.title("🧪 화학 탐구 활동 챗봇")
+
+    # --- 이름 입력 (최초 1회) ---
+    if not st.session_state.user_name:
+        name = st.text_input("이름(또는 학번)을 입력하세요", key="name_input")
+        if name:
+            st.session_state.user_name = name
+            st.rerun()
+        else:
+            st.info("채팅을 시작하려면 이름을 먼저 입력해 주세요.")
+            st.stop()
+
+    st.sidebar.success(f"접속자: {st.session_state.user_name}")
+    st.sidebar.caption(f"세션 ID: {st.session_state.session_id}")
+
+    # --- 기존 대화 표시 ---
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # --- 채팅 입력 및 답변 ---
+    if prompt := st.chat_input("질문을 입력하세요"):
+        # 사용자 메시지 표시 및 저장
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        save_to_sheet(
+            st.session_state.session_id,
+            st.session_state.user_name,
+            "user",
+            prompt,
+        )
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Gemini 응답 생성 (자동 재시도 포함)
+        answer = get_response(prompt)
+
+        # 어시스턴트 메시지 표시 및 저장
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        save_to_sheet(
+            st.session_state.session_id,
+            st.session_state.user_name,
+            "assistant",
+            answer,
+        )
+        with st.chat_message("assistant"):
+            with st.spinner("🤔 답변을 생성하고 있습니다..."):
+                answer = get_response(prompt)
+            st.markdown(answer)
+
+# ============================================================
+# 5-B. 관리자 페이지 (운영자용)
+# ============================================================
+elif page == "🔐 관리자 페이지":
+    st.title("🔐 관리자 페이지")
+
+    password = st.text_input("관리자 비밀번호를 입력하세요", type="password")
+
+    if password == ADMIN_PASSWORD:
+        st.success("인증 성공!")
+
+        rows = get_all_logs_from_sheet()
+
+        if not rows:
+            st.warning("아직 저장된 대화 기록이 없습니다.")
+            st.stop()
+
+        st.write(f"총 **{len(rows)}**건의 메시지가 저장되어 있습니다.")
+
+        # --- CSV 다운로드 (UTF-8 BOM 포함, 엑셀 한글 깨짐 방지) ---
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(["시간", "세션ID", "이름", "역할", "내용"])
+        for row in rows:
+            writer.writerow(row)
+
+        csv_data = "\ufeff" + csv_buffer.getvalue()
+
+        st.download_button(
+            label="📥 전체 대화 로그 CSV 다운로드",
+            data=csv_data.encode("utf-8"),
+            file_name=f"chat_logs_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+        )
+
+        # --- TXT 다운로드 ---
+        txt_buffer = ""
+        for row in rows:
+            if len(row) >= 5:
+                timestamp, session_id, user_name, role, content = (
+                    row[0], row[1], row[2], row[3], row[4],
+                )
+                txt_buffer += f"[{timestamp}] ({user_name} / {session_id}) {role}: {content}\n\n"
+
+        st.download_button(
+            label="📥 전체 대화 로그 TXT 다운로드",
+            data=txt_buffer.encode("utf-8"),
+            file_name=f"chat_logs_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            mime="text/plain",
+        )
+
+        # --- 미리보기 (최근 50건) ---
+        st.divider()
+        st.write("### 최근 대화 미리보기 (최근 50건)")
+        for row in rows[-50:]:
+            if len(row) >= 5:
+                timestamp, session_id, user_name, role, content = (
+                    row[0], row[1], row[2], row[3], row[4],
+                )
+                icon = "🧑‍🎓" if role == "user" else "🤖"
+                st.text(f"{icon} [{timestamp}] {user_name}: {content[:100]}")
+
+    elif password:
+        st.error("비밀번호가 틀렸습니다.")
